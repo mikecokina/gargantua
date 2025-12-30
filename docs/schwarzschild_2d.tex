@@ -1,0 +1,354 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb}
+\usepackage{physics}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{bm}
+
+\geometry{margin=2.5cm}
+
+\title{Gargantua\\
+\large Physical and Mathematical Foundations of Photon Ray Tracing\\
+in Schwarzschild Spacetime}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction}
+
+This document provides a complete physical and mathematical derivation
+of the equations implemented in the \texttt{Gargantua} ray tracer.
+The goal is not only to present final formulas, but to show
+\emph{why each equation is introduced and how it follows from General Relativity}.
+
+The document is written as a self-contained set of notes,
+intended to bridge the gap between theoretical GR and practical numerical implementation.
+
+We focus on:
+\begin{itemize}
+  \item null geodesics in Schwarzschild spacetime,
+  \item reduction of spacetime geodesics to an orbit equation,
+  \item geometric construction of initial conditions from ray data,
+  \item numerical integration using Runge--Kutta methods.
+\end{itemize}
+
+Geometric units $G=c=1$ are used throughout.
+
+% ============================================================
+\section{Spacetime Interval and Metric}
+
+In General Relativity, gravity is not a force but a manifestation of spacetime geometry.
+This geometry is encoded in the metric tensor $g_{\mu\nu}$.
+
+The invariant spacetime interval between two infinitesimally close events is
+
+\begin{equation}
+ds^2 = g_{\mu\nu}\,dx^\mu\,dx^\nu.
+\end{equation}
+
+This quantity plays the role analogous to distance in Euclidean space.
+All physical predictions must be invariant under coordinate transformations,
+which is why the metric formulation is fundamental.
+
+A particle trajectory is a curve $x^\mu(\lambda)$ parametrized
+by an affine parameter $\lambda$.
+
+% ============================================================
+\section{Why Extremize the Action}
+
+Free particles move along paths that extremize the spacetime interval.
+This principle generalizes the principle of least action from classical mechanics.
+
+The action is defined as
+
+\begin{equation}
+S = \int ds.
+\end{equation}
+
+The actual physical trajectory is the one for which $\delta S = 0$.
+
+For computational purposes, it is inconvenient to work with the square root in $ds$.
+Fortunately, extremizing $S=\int ds$ is equivalent to extremizing
+
+\begin{equation}
+S = \int \mathcal{L}\,d\lambda,
+\qquad
+\mathcal{L} = \frac{1}{2} g_{\mu\nu}
+\frac{dx^\mu}{d\lambda}
+\frac{dx^\nu}{d\lambda}.
+\end{equation}
+
+This quadratic Lagrangian produces the same geodesic equations
+and greatly simplifies the mathematics.
+
+The parameter $\lambda$ is called an \emph{affine parameter}.
+For photons, it does not correspond to proper time,
+but still parametrizes the curve consistently.
+
+% ============================================================
+\section{Schwarzschild Spacetime}
+
+The Schwarzschild metric describes spacetime outside a static,
+spherically symmetric mass $M$.
+
+In Schwarzschild coordinates $(t,r,\theta,\phi)$:
+
+\begin{equation}
+ds^2 =
+-\left(1-\frac{2M}{r}\right)dt^2
++\left(1-\frac{2M}{r}\right)^{-1}dr^2
++r^2 d\theta^2
++r^2\sin^2\theta\,d\phi^2.
+\end{equation}
+
+Due to spherical symmetry, any geodesic can be rotated
+into the equatorial plane:
+
+\begin{equation}
+\theta = \frac{\pi}{2}.
+\end{equation}
+
+The metric then reduces to
+
+\begin{equation}
+ds^2 =
+-\left(1-\frac{2M}{r}\right)dt^2
++\left(1-\frac{2M}{r}\right)^{-1}dr^2
++r^2 d\phi^2.
+\end{equation}
+
+The event horizon is located at
+
+\begin{equation}
+r_s = 2M.
+\end{equation}
+
+% ============================================================
+\section{Geodesic Lagrangian}
+
+Substituting the Schwarzschild metric into the quadratic action yields
+
+\begin{equation}
+\mathcal{L}
+=
+\frac{1}{2}\left[
+-\left(1-\frac{2M}{r}\right)\dot{t}^2
++\left(1-\frac{2M}{r}\right)^{-1}\dot{r}^2
++r^2\dot{\phi}^2
+\right],
+\end{equation}
+
+where dots denote derivatives with respect to the affine parameter $\lambda$.
+
+For photons (null geodesics), the constraint
+
+\begin{equation}
+ds^2 = 0
+\end{equation}
+
+must hold along the trajectory.
+
+% ============================================================
+\section{Conserved Quantities from Symmetries}
+
+Because the Lagrangian does not depend explicitly on $t$ or $\phi$,
+their conjugate momenta are conserved.
+This is a direct consequence of Noether's theorem.
+
+\subsection{Energy}
+
+\begin{equation}
+p_t = \frac{\partial\mathcal{L}}{\partial\dot{t}}
+= -\left(1-\frac{2M}{r}\right)\dot{t}.
+\end{equation}
+
+We define the conserved energy
+
+\begin{equation}
+E = \left(1-\frac{2M}{r}\right)\dot{t}.
+\end{equation}
+
+\subsection{Angular Momentum}
+
+\begin{equation}
+p_\phi = \frac{\partial\mathcal{L}}{\partial\dot{\phi}}
+= r^2\dot{\phi}.
+\end{equation}
+
+We define the conserved angular momentum
+
+\begin{equation}
+L = r^2\dot{\phi}.
+\end{equation}
+
+% ============================================================
+\section{Radial Equation of Motion}
+
+For null geodesics, impose the constraint
+
+\begin{equation}
+g_{\mu\nu}\dot{x}^\mu\dot{x}^\nu = 0.
+\end{equation}
+
+Substituting the metric and conserved quantities yields
+
+\begin{equation}
+\dot{r}^2
+=
+E^2
+-
+\left(1-\frac{2M}{r}\right)\frac{L^2}{r^2}.
+\end{equation}
+
+This equation describes radial motion in an effective potential.
+
+% ============================================================
+\section{Eliminating the Affine Parameter}
+
+The shape of the trajectory does not depend on how it is parametrized.
+We therefore eliminate $\lambda$ in favor of the angular coordinate $\phi$.
+
+Using the chain rule:
+
+\begin{equation}
+\frac{dr}{d\phi}
+=
+\frac{dr/d\lambda}{d\phi/d\lambda}
+=
+\frac{\dot{r}}{\dot{\phi}}.
+\end{equation}
+
+Since $L=r^2\dot{\phi}$:
+
+\begin{equation}
+\dot{\phi} = \frac{L}{r^2}.
+\end{equation}
+
+Substituting yields
+
+\begin{equation}
+\left(\frac{dr}{d\phi}\right)^2
+=
+\frac{r^4}{L^2}
+\left[
+E^2
+-
+\left(1-\frac{2M}{r}\right)\frac{L^2}{r^2}
+\right].
+\end{equation}
+
+% ============================================================
+\section{Substitution $u = 1/r$}
+
+Define the inverse radius
+
+\begin{equation}
+u = \frac{1}{r}.
+\end{equation}
+
+This substitution simplifies the equation and turns the orbit problem
+into a differential equation for $u(\phi)$.
+
+Using
+
+\begin{equation}
+\frac{dr}{d\phi} = -\frac{1}{u^2}\frac{du}{d\phi},
+\end{equation}
+
+we obtain
+
+\begin{equation}
+\left(\frac{du}{d\phi}\right)^2
+=
+\frac{1}{b^2}
+-
+u^2
++
+2Mu^3,
+\qquad
+b=\frac{L}{E}.
+\end{equation}
+
+Differentiating with respect to $\phi$ gives the second-order orbit equation:
+
+\begin{equation}
+\boxed{
+\frac{d^2u}{d\phi^2} + u = 3Mu^2.
+}
+\end{equation}
+
+This equation fully determines photon trajectories.
+
+% ============================================================
+\section{Geometric Initial Conditions}
+
+The numerical solver requires initial values
+
+\[
+u_0 = u(\phi_0),\qquad
+v_0 = \left.\frac{du}{d\phi}\right|_{\phi_0}.
+\]
+
+Given initial position $\bm{p}_0$ and direction $\bm{d}$,
+we construct a local polar basis around the black hole center $\bm{c}$:
+
+\begin{align}
+\hat{\bm{r}} &= \frac{\bm{p}_0-\bm{c}}{|\bm{p}_0-\bm{c}|},\\
+\hat{\bm{\phi}} &= (-\hat{r}_y,\hat{r}_x).
+\end{align}
+
+Velocity decomposition:
+
+\begin{equation}
+\dot{\bm{r}} = \dot{r}\hat{\bm{r}} + r\dot{\phi}\hat{\bm{\phi}}.
+\end{equation}
+
+Thus:
+
+\begin{align}
+\dot{r} &= \bm{d}\cdot\hat{\bm{r}},\\
+r\dot{\phi} &= \bm{d}\cdot\hat{\bm{\phi}}.
+\end{align}
+
+Using $u=1/r$, the initial slope is
+
+\begin{equation}
+\boxed{
+v_0
+=
+-\frac{1}{r_0}
+\frac{\bm{d}\cdot\hat{\bm{r}}}{\bm{d}\cdot\hat{\bm{\phi}}}.
+}
+\end{equation}
+
+% ============================================================
+\section{Numerical Integration: Runge--Kutta 4}
+
+The orbit equation is written as a first-order system:
+
+\begin{align}
+\frac{du}{d\phi} &= v,\\
+\frac{dv}{d\phi} &= -u + 3Mu^2.
+\end{align}
+
+This system is integrated using the classical fourth-order Runge--Kutta method.
+RK4 evaluates the slope at multiple points inside each step,
+providing high accuracy and stability for smooth trajectories.
+
+% ============================================================
+\section{Conclusion}
+
+The Gargantua ray tracer implements photon trajectories
+as null geodesics of Schwarzschild spacetime.
+Each component of the code corresponds directly
+to a well-defined physical and mathematical concept,
+making the implementation both accurate and interpretable.
+
+\end{document}
