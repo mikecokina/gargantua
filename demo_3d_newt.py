@@ -113,8 +113,9 @@ def main() -> None:
 
     # Render config
     width, height = 360, 200
+    aspect = width / height
     fov_horizontal_deg = 90.0
-    fov_vertical_deg = 55.0
+    fov_vertical_deg = np.rad2deg(2.0 * np.arctan(np.tan(np.deg2rad(fov_horizontal_deg) * 0.5) / aspect))
     up = xp.asarray([0.0, 1.0, 0.0], dtype=xp.float64)
 
     # Debug rays for top-down panel

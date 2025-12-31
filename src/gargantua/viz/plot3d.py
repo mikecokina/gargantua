@@ -65,6 +65,8 @@ class RenderSplitPlotter:
             self.ax_top = None
 
         self.ax_img.axis("off")
+        # Keep pixel aspect 1:1 in the rendered view (prevents oval circles)
+        self.ax_img.set_aspect("equal", adjustable="box")
         self.ax_img.set_title("Rendered view")
 
         # Artists (initialized in animate)
@@ -153,7 +155,7 @@ class RenderSplitPlotter:
             raise ValueError(msg)
 
         # Init image
-        self.im = self.ax_img.imshow(frames[0].img)
+        self.im = self.ax_img.imshow(frames[0].img, aspect="equal")
         self.ax_img.set_title("Rendered view")
 
         # Init topdown (optional)
