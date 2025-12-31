@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 from gargantua.backend import get_array_module, to_numpy
 from gargantua.camera.camera3d import Camera3D
 from gargantua.geometry import SphereSDF
@@ -122,7 +127,11 @@ def main() -> None:
 
     bh_center_np = to_numpy(xp, bh_center)
 
-    for i in range(frames_n):
+    it = range(frames_n)
+    if tqdm is not None:
+        it = tqdm(it, total=frames_n, desc="Rendering frames")
+
+    for i in it:
         # Pick ONE path:
         ro_np, forward_np = camera_path_slide_forward(i, frames_n)
         # ro_np, forward_np = camera_path_orbit_forward(i, frames_n, bh_center_np)
