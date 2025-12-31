@@ -76,7 +76,7 @@ def horizontal_fan_directions(
     return out
 
 
-def main() -> None:
+def main(*, no_gravity: bool = False) -> None:
     use_cuda = True
     xp = get_array_module(use_cuda)
 
@@ -89,7 +89,7 @@ def main() -> None:
     bh = BlackHoleBender(
         xp=xp,
         center=bh_center,
-        mass=0.35,
+        mass=0.0 if no_gravity else 0.35,
         horizon=0.15,
         softening=5e-2,
     )
@@ -210,4 +210,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(no_gravity=False)

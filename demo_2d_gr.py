@@ -13,7 +13,7 @@ from gargantua.physics.geodesics import (
 from gargantua.viz.plot2d import Plotter2D
 
 
-def main() -> None:
+def main(*, no_gravity: bool = False) -> None:
     use_cuda = False
     xp = get_array_module(use_cuda)
 
@@ -24,7 +24,7 @@ def main() -> None:
     # Horizon = 2M, photon sphere = 3M.
     bh_center = xp.asarray([0.0, 3.0], dtype=xp.float64)
     cfg = SchwarzschildConfig2D(
-        mass_length=0.35,  # tune this to see stronger/weaker lensing
+        mass_length=0.0 if no_gravity else 0.35,  # tune this to see stronger/weaker lensing
         dphi=2e-3,
         escape_radius=60.0,
         max_steps=60_000,
@@ -66,4 +66,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(no_gravity=False)

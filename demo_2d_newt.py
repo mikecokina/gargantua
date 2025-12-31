@@ -10,7 +10,7 @@ from gargantua.scene import Scene, SceneBounds
 from gargantua.viz.plot2d import Plotter2D
 
 
-def main() -> None:
+def main(*, no_gravity: bool = False) -> None:
     use_cuda = True
     xp = get_array_module(use_cuda)
 
@@ -18,7 +18,7 @@ def main() -> None:
     bh = BlackHoleBender(
         xp=xp,
         center=xp.asarray([0.0, 3.0], dtype=xp.float64),
-        mass=1.6,
+        mass=0.0 if no_gravity else 1.6,
         horizon=0.28,
     )
 
@@ -64,4 +64,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(no_gravity=False)
