@@ -56,8 +56,8 @@ IMAGE_HEIGHT = int(round(IMAGE_WIDTH / IMAGE_ASPECT))
 IMAGE_ASPECT = IMAGE_WIDTH / IMAGE_HEIGHT  # enforce exact aspect
 
 # ---- Light ----
-LIGHT_POSITION = xp.array([-3.0, 2.2, 4.6], dtype=xp.float64)
-LIGHT_INTENSITY = 40.0
+LIGHT_POSITION = xp.array([3.0, 2.2, 4.6], dtype=xp.float64)
+LIGHT_INTENSITY = 60.0
 
 # ---- Camera ----
 CAMERA_POSITION = xp.array([2.6, 4.0, 0.4], dtype=xp.float64)
@@ -77,7 +77,7 @@ SHADOW_EVERY = 2
 
 # ---- Medium / Cloud density (PHYSICAL meaning) ----
 # Higher values -> more extinction (darker, stronger shadows), lower values -> more transparent.
-FOG_DENSITY = 0.01
+FOG_DENSITY = 0.00
 CLOUD_DENSITY = 1.2
 EDGE_SOFTNESS = 0.12
 
