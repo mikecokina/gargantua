@@ -123,7 +123,7 @@ def main(*, no_gravity: bool = False) -> None:
     decimate_stride = 2
     look_line_len = 6.0  # just for visualization in the top-down panel
 
-    frames_n = 10
+    frames_n = 15
     frames: list[RenderFrame] = []
 
     bh_center_np = to_numpy(xp, bh_center)
