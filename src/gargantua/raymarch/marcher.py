@@ -13,8 +13,60 @@ if TYPE_CHECKING:
     from gargantua.scene import Scene
 
 
+def _adaptive_ds_cap(
+    *,
+    xp: Any,
+    max_ds_step: float,
+    dist_pre: Any,
+    eps: float,
+    k: float,
+) -> Any:
+    """Compute an adaptive per-substep ds cap.
+
+    The returned cap is:
+
+        ds_cap = min(max_ds_step, k * max(dist_pre, eps))
+
+    Motivation:
+      - max_ds_step prevents big single updates (tunneling).
+      - k * dist_pre reduces grazing overshoot near the surface, where dist_pre is small.
+
+    Args:
+        xp: NumPy or CuPy module.
+        max_ds_step: Hard cap for a single substep.
+        dist_pre: SDF distance evaluated at the start of the substep.
+        eps: Hit threshold for SDF.
+        k: Surface factor controlling conservativeness near the object.
+
+    Returns:
+        Array of caps with the same shape as dist_pre.
+    """
+    ds_cap_surface = k * xp.maximum(
+        dist_pre,
+        xp.asarray(float(eps), dtype=xp.float64),
+    )
+    return xp.minimum(
+        xp.asarray(float(max_ds_step), dtype=xp.float64),
+        ds_cap_surface,
+    )
+
+
 class RayMarcher(RayTracer2D):
-    """Dimension-agnostic ray marcher."""
+    """Scalar ray marcher that advances a single ray using an SDF distance estimate.
+
+    This marcher:
+      - steps forward by ds derived from the scene surface SDF
+      - detects object hits (dist < eps)
+      - detects BH capture via analytic ray-sphere intersection against the horizon
+      - updates direction via scene.bh.bend(d, p, ds) (Newtonian-style bending)
+
+    Intended use:
+      - debugging, interactive plots, and single-ray inspection
+
+    Notes:
+      - Uses a horizon intersection test to avoid "step past horizon" artifacts.
+      - Step size is optionally slowed down near the BH via _step_scale_near_bh().
+    """
 
     HORIZON_EPS: float = 1e-6
 
@@ -25,6 +77,12 @@ class RayMarcher(RayTracer2D):
         self.scene = scene
 
     def _step_scale_near_bh(self, p: Any, bh: BlackHoleBender) -> float:
+        """Return a scalar multiplier to slow steps near the BH.
+
+        Uses cfg.slow_radius and cfg.slow_factor to interpolate a scale:
+          - 1.0 outside slow_radius
+          - slow_factor at the BH center
+        """
         dist = float(self.xp.linalg.norm(p - bh.center))
         if dist >= self.cfg.slow_radius:
             return 1.0
@@ -38,6 +96,10 @@ class RayMarcher(RayTracer2D):
             center: Any,
             radius: float,
     ) -> float | None:
+        """Return the nearest non-negative ray-sphere intersection distance, or None.
+
+        Solves |origin + t*direction - center|^2 = radius^2 and returns min(t) for t >= 0.
+        """
         oc = origin - center
         a = float(self.xp.dot(direction, direction))
         b = 2.0 * float(self.xp.dot(oc, direction))
@@ -57,7 +119,11 @@ class RayMarcher(RayTracer2D):
         return min(candidates)
 
     def trace(self, origin: Any, direction: Any) -> RayMarchResult:
-        """Trace using the scene provided at construction time."""
+        """Trace using the scene provided at construction time.
+
+        Returns:
+            RayMarchResult with a polyline of visited points.
+        """
         scene = self.scene
         xp = self.xp
 
@@ -119,6 +185,21 @@ class RayMarcher(RayTracer2D):
 
 @dataclass(frozen=True, slots=True)
 class ImageMarchConfig:
+    """Configuration for batched image marchers (Newtonian and Schwarzschild).
+
+    max_steps:
+      Outer iteration count (each iteration may include substeps).
+    eps:
+      Hit threshold for surface SDF.
+    min_step / max_step:
+      Newtonian marcher uses [min_step, max_step] clipping.
+      Schwarzschild marcher uses [0, max_step] clipping (no forced min_step).
+    max_ds_step:
+      Hard cap for a single substep. If ds_total > max_ds_step, we split into multiple substeps.
+    ds_surface_factor:
+      Adaptive cap factor applied near surfaces: ds <= k * max(dist_pre, eps).
+    """
+
     max_steps: int = 220
     eps: float = 1e-3
     min_step: float = 1e-3
@@ -135,12 +216,32 @@ class ImageMarchConfig:
 
 @dataclass(frozen=True, slots=True)
 class ImageMarchResult:
+    """Batched image marcher outputs.
+
+    hit:
+      Boolean mask where the surface was hit.
+    fell_in:
+      Boolean mask where the ray fell into the BH (horizon/capture).
+    traveled:
+      Accumulated traveled distance per pixel.
+    """
+
     hit: Any
     fell_in: Any
     traveled: Any
 
 
 class ImageMarcherNewtonian:
+    """Batched image marcher for Newtonian-style straight-line rays with bending.
+
+    Marches a per-pixel ray bundle:
+      - position update is straight line: p += rd * ds
+      - direction update uses scene.bh.bend_batch(rd, p, ds)
+      - termination uses SDF for objects and a horizon SDF for BH capture
+
+    Uses substepping with an adaptive cap near surfaces to reduce tunneling.
+    """
+
     def __init__(self, xp: ArrayModule, config: ImageMarchConfig, scene: Any) -> None:
         """Initialise the marcher."""
         self.xp = xp
@@ -231,14 +332,12 @@ class ImageMarcherNewtonian:
                 # AND adaptively by distance to the object to reduce grazing overshoot.
                 k = float(getattr(cfg, "ds_surface_factor", 0.25))  # try 0.25, then 0.1 if needed
 
-                ds_cap_surface = k * xp.maximum(
-                    d_obj_pre,
-                    xp.asarray(float(cfg.eps), dtype=xp.float64),
-                )
-
-                ds_cap = xp.minimum(
-                    xp.asarray(max_ds_step, dtype=xp.float64),
-                    ds_cap_surface,
+                ds_cap = _adaptive_ds_cap(
+                    xp=xp,
+                    max_ds_step=max_ds_step,
+                    dist_pre=d_obj_pre,
+                    eps=float(cfg.eps),
+                    k=k,
                 )
 
                 ds = xp.minimum(remaining, ds_cap)
@@ -314,6 +413,15 @@ class ImageMarcherSchwarzschild:
         self.scene = scene
 
     def march(self, ro: Any, rd0: Any) -> ImageMarchResult:
+        """March a full image bundle of rays.
+
+        Args:
+            ro: Camera origin, shape (3,) or broadcast-compatible with rd0.
+            rd0: Initial ray directions, shape (H, W, 3).
+
+        Returns:
+            ImageMarchResult(hit, fell_in, traveled)
+        """
         xp = self.xp
         cfg = self.config
 
@@ -393,14 +501,12 @@ class ImageMarcherSchwarzschild:
                 #   smaller k -> smaller steps near the object -> less overshoot (slower).
                 k = float(getattr(cfg, "ds_surface_factor", 0.25))  # try 0.25, then 0.1 if needed
 
-                ds_cap_surface = k * xp.maximum(
-                    dist_pre,
-                    xp.asarray(float(cfg.eps), dtype=xp.float64),
-                )
-
-                ds_cap = xp.minimum(
-                    xp.asarray(max_ds_step, dtype=xp.float64),
-                    ds_cap_surface,
+                ds_cap = _adaptive_ds_cap(
+                    xp=xp,
+                    max_ds_step=max_ds_step,
+                    dist_pre=dist_pre,
+                    eps=float(cfg.eps),
+                    k=k,
                 )
 
                 ds = xp.minimum(remaining, ds_cap)
@@ -429,4 +535,3 @@ class ImageMarcherSchwarzschild:
                 remaining = remaining - ds
 
         return ImageMarchResult(hit=hit, fell_in=fell_in, traveled=traveled)
-
