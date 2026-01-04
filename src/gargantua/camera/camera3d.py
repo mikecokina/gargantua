@@ -22,8 +22,12 @@ class Camera3D:
     def basis(self, xp: ArrayModule) -> tuple[Any, Any, Any]:
         f = normalize_batch(xp, xp.asarray(self.forward, dtype=xp.float64))
         up_hint = normalize_batch(xp, xp.asarray(self.up, dtype=xp.float64))
-        r = normalize_batch(xp, cross(xp, f, up_hint))
-        u = normalize_batch(xp, cross(xp, r, f))
+
+        # right-handed: right = up x forward
+        r = normalize_batch(xp, cross(xp, up_hint, f))
+
+        # recompute true up: up = forward x right
+        u = normalize_batch(xp, cross(xp, f, r))
         return f, r, u
 
     def ray_directions_grid(self, xp: ArrayModule, width: int, height: int) -> Any:
