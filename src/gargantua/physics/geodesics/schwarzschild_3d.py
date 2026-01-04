@@ -35,11 +35,16 @@ class SchwarzschildConfig3D:
         M = GM/c^2 in your simulation length units (geometric units).
         Event horizon radius is r_h = 2M.
       dphi:
-        Base step in phi used by the RK4 integrator. The effective step may flip sign
-        per-ray depending on the direction of increasing phi for that ray.
+        Base step in phi used by the RK4 integrator.
+
+        For the batched stepper (advance_batch):
+          - ds is a world-space step suggestion from the marcher (typically an SDF distance).
+          - advance_batch maps ds to an angular step |dphi| approximately as ds / r, where r is
+            the current radius estimate for that ray. This keeps world-space displacement roughly
+            proportional to ds.
       phi_scale_max:
         Maximum multiplier applied when mapping marcher-supplied ds into an angular step.
-        Used by the batched stepper to keep dphi within a conservative bound.
+        Used by the batched stepper to cap |dphi| <= dphi * phi_scale_max for stability.
       max_steps:
         Maximum number of integration steps for trace() style integration.
       escape_radius:
@@ -346,8 +351,11 @@ class SchwarzschildGeodesicStepper3D:
       - Each ray gets its own plane basis (e1, e2) through BH center.
       - Dynamics are integrated in that plane using the same u(phi) ODE:
             u'' + u = 3 M u^2
-      - The marcher provides ds (usually from an SDF distance estimate).
-        We map ds to a conservative dphi using cfg.dphi and cfg.phi_scale_max.
+      - The marcher provides ds (usually from an SDF distance estimate in world-space units).
+        advance_batch maps ds into an angular step dphi using the current radius estimate r so
+        that the world-space displacement stays roughly proportional to ds:
+            |dphi| ~= ds / r
+        and caps |dphi| <= cfg.dphi * cfg.phi_scale_max for stability.
 
     Notes:
       - Near-radial rays are detected and advanced by straight-line stepping.
@@ -415,7 +423,11 @@ class SchwarzschildGeodesicStepper3D:
         dr_dphi = r0_safe * dr_dlambda / denom
         v0 = -(1.0 / (r0_safe * r0_safe)) * dr_dphi
 
-        sign = xp.where(r_dphi_dlambda >= 0.0, xp.asarray(1.0, dtype=xp.float64), xp.asarray(-1.0, dtype=xp.float64))
+        sign = xp.where(
+            r_dphi_dlambda >= 0.0,
+            xp.asarray(1.0, dtype=xp.float64),
+            xp.asarray(-1.0, dtype=xp.float64),
+        )
 
         return {
             "center": center,
@@ -485,12 +497,16 @@ class SchwarzschildGeodesicStepper3D:
     def advance_batch(self, state: dict[str, Any], ds: Any) -> tuple[Any, Any, Any]:
         """Advance a batch of rays by a marcher-supplied distance ds.
 
-        The marcher provides ds (typically derived from an SDF distance estimate).
-        We map ds into an angular step dphi as:
+        The marcher provides ds (typically derived from an SDF distance estimate, in world-space units).
+        For non-radial rays we map ds into an angular step dphi in a radius-aware way:
 
-            base = cfg.dphi
-            scale = clip(ds / base, 0, cfg.phi_scale_max)
-            h = base * scale * sign
+            r_est = 1 / max(u, tiny)
+            |dphi_target| ~= ds / r_est
+            |dphi| = min(|dphi_target|, cfg.dphi * cfg.phi_scale_max)
+            h = |dphi| * sign
+
+        This keeps the world-space displacement per update (approximately r * |dphi|) roughly proportional
+        to ds while maintaining a conservative cap on the angular step.
 
         Then:
           - Non-radial rays: integrate u(phi) via RK4, update phi, embed back into 3D.
@@ -526,10 +542,16 @@ class SchwarzschildGeodesicStepper3D:
 
         ds = xp.asarray(ds, dtype=xp.float64)
 
-        # Map ds to dphi conservatively
-        base = xp.asarray(cfg.dphi, dtype=xp.float64)
-        scale = xp.clip(ds / base, 0.0, float(cfg.phi_scale_max))  # was 0.25 lower bound
-        h = base * scale * sign
+        # Map ds to dphi conservatively (radius-aware so world displacement ~= ds)
+        u_safe = xp.maximum(u, xp.asarray(1e-12, dtype=xp.float64))
+        r_est = 1.0 / u_safe
+
+        h_target = ds / xp.maximum(r_est, xp.asarray(1e-12, dtype=xp.float64))
+
+        h_cap = xp.asarray(float(cfg.dphi) * float(cfg.phi_scale_max), dtype=xp.float64)
+        h_mag = xp.minimum(h_target, h_cap)
+
+        h = h_mag * sign
 
         # Geodesic update (non-radial)
         u_new, v_new = self._rk4_step_batch(u, v, h)
