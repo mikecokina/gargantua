@@ -14,28 +14,45 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class SchwarzschildConfig3D:
-    """3D Schwarzschild null geodesic configuration.
+    """Configuration for 3D Schwarzschild null-geodesic tracing (per-ray planar ODE).
 
-    Uses planar ODE in each ray's own plane:
-        u'' + u = 3 M u^2, where u = 1/r and derivatives are wrt phi.
+    Each ray is integrated in its own 2D plane that passes through:
+      - the BH center
+      - the ray origin
+      - the initial ray direction
 
-    mass_length:
+    Within that plane, the null geodesic in Schwarzschild spacetime is approximated by
+    the standard planar ODE in terms of u = 1/r, with derivatives with respect to phi:
+
+        u'' + u = 3 M u^2
+
+    where:
+      - r is the areal radius from the BH center
+      - M is the mass-length (GM/c^2) expressed in your simulation length units
+
+    Fields:
+      mass_length:
         M = GM/c^2 in your simulation length units (geometric units).
-        Event horizon radius r_h = 2M.
-    dphi:
-        Base step in phi for integrator.
-    max_steps:
-        Maximum number of phi-steps for tracer-style trace().
-    escape_radius:
-        Stop if r grows beyond this.
-    radial_eps:
-        Near-radial rays (tiny angular component) use a straight fallback.
-    hit_eps:
-        Surface hit threshold if surface is provided.
-    fallback_ds:
-        Fallback step size for near-radial rays in trace().
-    horizon_plot_eps:
-        Offset used to place last point just outside horizon for stable plotting.
+        Event horizon radius is r_h = 2M.
+      dphi:
+        Base step in phi used by the RK4 integrator. The effective step may flip sign
+        per-ray depending on the direction of increasing phi for that ray.
+      phi_scale_max:
+        Maximum multiplier applied when mapping marcher-supplied ds into an angular step.
+        Used by the batched stepper to keep dphi within a conservative bound.
+      max_steps:
+        Maximum number of integration steps for trace() style integration.
+      escape_radius:
+        Terminate as escaped if r grows beyond this value.
+      radial_eps:
+        Rays with tiny angular component (|r * dphi/dlambda| small) are treated as nearly
+        radial and use a straight-line fallback in trace().
+      hit_eps:
+        Surface hit threshold (in SDF distance units) when surface is provided.
+      fallback_ds:
+        Step length for the near-radial straight-line fallback in trace().
+      horizon_plot_eps:
+        Small offset used to place the final point just outside the horizon for stable plotting.
     """
 
     mass_length: float
@@ -51,7 +68,13 @@ class SchwarzschildConfig3D:
 
 @dataclass(frozen=True, slots=True)
 class SchwarzschildBlackHole3D:
-    """Schwarzschild BH parameters in simulation units."""
+    """Schwarzschild black hole parameters in simulation units.
+
+    This object holds:
+      - xp backend (NumPy or CuPy)
+      - BH center in world coordinates
+      - SchwarzschildConfig3D configuration
+    """
 
     xp: ArrayModule
     center: Any
@@ -59,30 +82,56 @@ class SchwarzschildBlackHole3D:
 
     @property
     def horizon_radius(self) -> float:
+        """Event horizon radius r_h = 2M in simulation units."""
         return 2.0 * self.cfg.mass_length
 
 
 class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
-    """Real GR: 3D Schwarzschild null geodesic tracer with optional SDF hit testing.
+    """3D Schwarzschild null geodesic tracer with optional SDF hit testing.
 
-    Same interface as SchwarzschildNullGeodesicTracer2D.trace(), but embedded in 3D:
-    each ray moves in the plane spanned by (r0, d0) through BH center.
+    This is a single-ray tracer that integrates the planar u(phi) ODE per ray, then
+    embeds the resulting planar curve back into 3D using a per-ray orthonormal basis.
 
-    Returns RayMarchResult(hit, fell_in, escaped, termination, points).
+    Termination conditions:
+      - hit: surface SDF distance < cfg.hit_eps (if surface is provided)
+      - horizon: r <= 2M
+      - far: r >= cfg.escape_radius or u <= 0
+      - max_steps: loop limit reached
+
+    Returns:
+      RayMarchResult(hit, fell_in, escaped, termination, points)
     """
 
     def __init__(self, xp: ArrayModule, bh: SchwarzschildBlackHole3D, surface: SDF | None = None) -> None:
-        """Initialise SchwarzschildNullGeodesicTracer3D."""
+        """Initialise the tracer.
+
+        Args:
+            xp: Backend module (NumPy or CuPy).
+            bh: Schwarzschild black hole descriptor.
+            surface: Optional signed distance field for hit testing.
+        """
         self.xp = xp
         self.bh = bh
         self.surface = surface
 
     def _rk4_step(self, u: float, v: float, h: float) -> tuple[float, float]:
-        """Stepper.
+        """Advance (u, v) by one RK4 step with step size h in phi.
 
-        RK4 for:
-        u' = v
-        v' = -u + 3 M u^2
+        Integrates the first-order system corresponding to:
+
+            u'' + u = 3 M u^2
+
+        with:
+            u' = v
+            v' = -u + 3 M u^2
+
+        Args:
+            u: Current u = 1/r.
+            v: Current v = du/dphi.
+            h: Step in phi (can be negative).
+
+        Returns:
+            (u_next, v_next)
         """
         m = self.bh.cfg.mass_length
 
@@ -117,13 +166,27 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
         return u_next, v_next
 
     def _check_surface_hit(self, p_world: Any) -> bool:
+        """Return True if a surface is provided and p_world is within hit_eps of it."""
         if self.surface is None:
             return False
         dist = float(self.surface.sdf(p_world))
         return dist < self.bh.cfg.hit_eps
 
     def _make_plane_basis(self, r0: Any, d0: Any) -> tuple[Any, Any, Any]:
-        """Return orthonormal (e1, e2, n) spanning ray plane."""
+        """Build an orthonormal basis (e1, e2, n) for the ray's motion plane.
+
+        The plane is defined by:
+          - r0: vector from BH center to ray origin
+          - d0: initial ray direction
+
+        Construction:
+          - e1 aligns with the initial radial direction (unit r0)
+          - n is the plane normal, proportional to cross(r0, d0)
+          - e2 completes the right-handed basis: e2 = normalize(cross(n, e1))
+
+        For nearly radial rays where cross(r0, d0) is tiny, a stable fallback normal is
+        built using a world-up vector.
+        """
         xp = self.xp
         rhat = normalize(xp, r0)
 
@@ -143,6 +206,18 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
         return e1, e2, n
 
     def _trace_nearly_radial(self, origin: Any, direction: Any) -> RayMarchResult:
+        """Fallback tracer for nearly radial rays.
+
+        If the ray's angular component is too small (|r * dphi/dlambda| < radial_eps),
+        the u(phi) formulation becomes ill-conditioned. In that case, this routine
+        advances the ray in a straight line with step size cfg.fallback_ds and checks:
+          - SDF surface hit (if provided)
+          - horizon crossing (r <= 2M)
+          - escape (r >= cfg.escape_radius)
+
+        Returns:
+            RayMarchResult with a polyline of visited points in world space.
+        """
         xp = self.xp
         cfg = self.bh.cfg
         p = xp.asarray(origin, dtype=xp.float64)
@@ -167,6 +242,26 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
         return RayMarchResult(False, False, True, "max_steps", xp.stack(pts))
 
     def trace(self, origin: Any, direction: Any) -> RayMarchResult:
+        """Trace a single ray in 3D using a per-ray planar Schwarzschild ODE.
+
+        Steps:
+          1. Convert origin and direction to xp arrays and normalize direction.
+          2. Build the ray plane basis (e1, e2) around BH center.
+          3. Compute initial polar angle phi in that plane.
+          4. Convert the initial 3D direction into planar polar components to infer v0.
+          5. Integrate (u, v) forward in phi using RK4 and embed points back to 3D.
+
+        Notes:
+          - If the initial angular component is too small, uses _trace_nearly_radial().
+          - Points are recorded in world coordinates.
+
+        Args:
+            origin: Ray origin in world coordinates.
+            direction: Initial ray direction in world coordinates.
+
+        Returns:
+            RayMarchResult(hit, fell_in, escaped, termination, points)
+        """
         xp = self.xp
         cfg = self.bh.cfg
 
@@ -238,23 +333,40 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
 
 @dataclass(frozen=True, slots=True)
 class SchwarzschildGeodesicStepper3D:
-    """Batch-friendly stepper for ImageMarcherSchwarzschild.
+    """Batch-friendly 3D Schwarzschild geodesic stepper for image marching.
 
-    Required by marcher:
-        state = init_batch(ro, rd0)
-        p_new, rd_new, fell_in_now = advance_batch(state, ds)
+    Intended consumer:
+      - ImageMarcherSchwarzschild (or equivalent)
 
-    This uses the same u(phi) ODE, but batched and embedded in 3D per ray plane.
+    Required interface:
+      - state = init_batch(ro, rd0)
+      - p_new, rd_new, fell_in_now = advance_batch(state, ds)
 
-    ds meaning:
-      - marcher supplies ds from SDF distance (clipped)
-      - we map ds -> dphi by scaling around cfg.dphi conservatively
+    Approach:
+      - Each ray gets its own plane basis (e1, e2) through BH center.
+      - Dynamics are integrated in that plane using the same u(phi) ODE:
+            u'' + u = 3 M u^2
+      - The marcher provides ds (usually from an SDF distance estimate).
+        We map ds to a conservative dphi using cfg.dphi and cfg.phi_scale_max.
+
+    Notes:
+      - Near-radial rays are detected and advanced by straight-line stepping.
+      - The state dict is mutated in-place by advance_batch().
     """
 
     xp: ArrayModule
     bh: SchwarzschildBlackHole3D
 
     def init_batch(self, ro: Any, rd0: Any) -> dict[str, Any]:
+        """Initialize batched geodesic state for a set of rays.
+
+        Args:
+            ro: Ray origins, shape (..., 3).
+            rd0: Initial ray directions, shape (..., 3).
+
+        Returns:
+            A state dict containing per-ray plane basis, (phi, u, v), and flags used by advance_batch().
+        """
         xp = self.xp
         center = xp.asarray(self.bh.center, dtype=xp.float64)
 
@@ -319,6 +431,23 @@ class SchwarzschildGeodesicStepper3D:
         }
 
     def _rk4_step_batch(self, u: Any, v: Any, h: Any) -> tuple[Any, Any]:
+        """Vectorized RK4 step for the batched (u, v) system.
+
+        Integrates the first-order form of:
+            u'' + u = 3 M u^2
+
+        with:
+            u' = v
+            v' = -u + 3 M u^2
+
+        Args:
+            u: Batched u = 1/r, shape (...,).
+            v: Batched v = du/dphi, shape (...,).
+            h: Batched step in phi, shape (...,). Can be negative per-ray.
+
+        Returns:
+            (u_next, v_next) with the same shape as inputs.
+        """
         xp = self.xp
         # noinspection PyUnusedLocal
         m = xp.asarray(self.bh.cfg.mass_length, dtype=xp.float64)  # it is actually used in `f_v` method bellow
@@ -354,6 +483,32 @@ class SchwarzschildGeodesicStepper3D:
         return u_next, v_next
 
     def advance_batch(self, state: dict[str, Any], ds: Any) -> tuple[Any, Any, Any]:
+        """Advance a batch of rays by a marcher-supplied distance ds.
+
+        The marcher provides ds (typically derived from an SDF distance estimate).
+        We map ds into an angular step dphi as:
+
+            base = cfg.dphi
+            scale = clip(ds / base, 0, cfg.phi_scale_max)
+            h = base * scale * sign
+
+        Then:
+          - Non-radial rays: integrate u(phi) via RK4, update phi, embed back into 3D.
+          - Radial rays: take a straight-line step p += d * ds.
+
+        State mutation:
+          Updates "p", "d", "phi", "u", "v" in-place.
+
+        Args:
+            state: Mutable per-ray state returned by init_batch().
+            ds: Step distances, shape (...,).
+
+        Returns:
+            (p_new, d_new, fell_in_now)
+              - p_new: New positions, shape (..., 3)
+              - d_new: New directions, shape (..., 3)
+              - fell_in_now: Boolean mask, shape (...,), True where r <= horizon radius
+        """
         xp = self.xp
         cfg = self.bh.cfg
 
