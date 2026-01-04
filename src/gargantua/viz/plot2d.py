@@ -1,37 +1,42 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
-import matplotlib
+import matplotlib as mpl
 
 # IMPORTANT: set backend before importing pyplot
 # - If running inside PyCharm scientific mode, their custom backend can break.
 # - Prefer a stable GUI backend if available; fallback to Agg.
 _BACKEND = os.environ.get("GARGANTUA_MPL_BACKEND", "").strip()
 if _BACKEND:
-    matplotlib.use(_BACKEND, force=True)
+    mpl.use(_BACKEND, force=True)
 else:
     # Try stable interactive backends first; fallback to Agg.
     for candidate in ("TkAgg", "QtAgg", "Agg"):
         # noinspection PyBroadException
         try:
-            matplotlib.use(candidate, force=True)
+            mpl.use(candidate, force=True)
             break
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover  # noqa: BLE001, S112
             continue
 
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 
 from gargantua.backend import ArrayModule, to_numpy  # noqa: E402
-from gargantua.protocols import Drawable2D  # noqa: E402
-from gargantua.raymarch.config import RayMarchResult  # noqa: E402
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from gargantua.protocols import Drawable2D
+    from gargantua.raymarch.config import RayMarchResult
 
 
 class Plotter2D:
     """Matplotlib plotter for the 2D demo."""
 
     def __init__(self) -> None:
+        """Initialize the plotter."""
         _, ax = plt.subplots(figsize=(8, 8))
         self.ax = ax
         ax.set_aspect("equal", "box")
