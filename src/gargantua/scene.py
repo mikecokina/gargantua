@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
+from gargantua.physics.geodesics.schwarzschild_3d import SchwarzschildGeodesicStepper3D
 from gargantua.physics.newtonian import BlackHoleBender
 from gargantua.protocols import Drawable2D, SDF
 
@@ -19,6 +20,6 @@ class Scene:
     """Complete scene definition."""
 
     surface: SDF
-    bh: BlackHoleBender
+    bh: BlackHoleBender | SchwarzschildGeodesicStepper3D
     bounds: SceneBounds
     drawables: List[Drawable2D]
