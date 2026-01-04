@@ -124,6 +124,14 @@ class ImageMarchConfig:
     min_step: float = 1e-3
     max_step: float = 0.08
 
+    # Hard cap for a single GR step (substepping happens if ds > max_ds_step)
+    # Set to something smaller than max_step to avoid tunneling.
+    max_ds_step: float = 0.02
+
+    # Adaptive cap near surfaces (fraction of dist_pre used as an extra ds cap)
+    # 0.25 is a good start; 0.1 is more robust but slower.
+    ds_surface_factor: float = 0.25
+
 
 @dataclass(frozen=True, slots=True)
 class ImageMarchResult:
@@ -132,41 +140,12 @@ class ImageMarchResult:
     traveled: Any
 
 
-class ImageMarcher:
+class ImageMarcherNewtonian:
     def __init__(self, xp: ArrayModule, config: ImageMarchConfig, scene: Any) -> None:
         """Initialise the marcher."""
         self.xp = xp
         self.config = config
         self.scene = scene
-
-    def _segment_hits_sphere(self, p: Any, d: Any, ds: Any, center: Any, radius: float) -> Any:
-        """Check whether the segment from p to p + d*ds intersects sphere(center, radius).
-
-        p: (H,W,3)
-        d: (H,W,3) normalized
-        ds: (H,W)
-        returns: (H,W) bool
-        """
-        xp = self.xp
-
-        oc = p - center[None, None, :]  # (H,W,3)
-        a = xp.sum(d * d, axis=-1)  # ~1
-        b = 2.0 * xp.sum(oc * d, axis=-1)
-        c = xp.sum(oc * oc, axis=-1) - radius * radius
-
-        disc = b * b - 4.0 * a * c
-        hit = disc >= 0.0
-        if not bool(xp.any(hit)):
-            return hit
-
-        s = xp.sqrt(xp.maximum(disc, 0.0))
-        t0 = (-b - s) / (2.0 * a)
-        t1 = (-b + s) / (2.0 * a)
-
-        # segment is [0, ds]
-        in0 = (t0 >= 0.0) & (t0 <= ds)
-        in1 = (t1 >= 0.0) & (t1 <= ds)
-        return hit & (in0 | in1)
 
     def march(self, ro: Any, rd0: Any) -> ImageMarchResult:
         """March.
@@ -186,40 +165,268 @@ class ImageMarcher:
         fell_in = xp.zeros((height, width), dtype=bool)
         traveled = xp.zeros((height, width), dtype=xp.float64)
 
+        # NEW: cap for a single advance (substepping happens if ds_total > max_ds_step)
+        max_ds_step = float(getattr(cfg, "max_ds_step", cfg.max_step))
+        max_ds_step = max(max_ds_step, 1e-12)
+
         for _ in range(int(cfg.max_steps)):
             active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
             if not bool(xp.any(active)):
                 break
 
-            # BH capture
-            dist_bh = xp.linalg.norm(p - self.scene.bh.center[None, None, :], axis=-1)
-            fell_in = fell_in | (active & (dist_bh < float(self.scene.bh.horizon)))
+            # ------------------------------------------------------------
+            # Immediate termination tests at current position
+            # ------------------------------------------------------------
+
+            # Object hit (SDF)
+            d_obj0 = self.scene.surface.sdf(p)  # (H,W)
+            hit = hit | (active & (d_obj0 < float(cfg.eps)))
+
+            # BH capture (SDF of horizon sphere)
+            # horizon_sdf(p) = |p-center| - horizon_radius
+            dist_bh0 = xp.linalg.norm(p - self.scene.bh.center[None, None, :], axis=-1)
+            h_sdf0 = dist_bh0 - float(self.scene.bh.horizon)
+            fell_in = fell_in | (active & (h_sdf0 <= 0.0))
 
             active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
             if not bool(xp.any(active)):
                 break
 
-            d_obj = self.scene.surface.sdf(p)  # (H,W)
-            hit = hit | (active & (d_obj < float(cfg.eps)))
+            # ------------------------------------------------------------
+            # Step size selection (SDF-driven) + substepping for robustness
+            # ------------------------------------------------------------
 
-            active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
-            if not bool(xp.any(active)):
+            # Base desired step from object SDF (like before).
+            # For Newtonian it is OK to keep min_step, but if you want maximum robustness
+            # near surfaces, you can set min_step=0 in ImageMarchConfig for this marcher too.
+            ds_total = xp.clip(d_obj0, float(cfg.min_step), float(cfg.max_step))
+            ds_total = ds_total * active.astype(xp.float64)
+
+            if float(xp.max(ds_total)) <= 0.0:
                 break
 
-            ds = xp.clip(d_obj, float(cfg.min_step), float(cfg.max_step))
-            ds = ds * active.astype(xp.float64)
+            # Batch-wide number of sub-steps.
+            n_sub = int(xp.ceil(xp.max(ds_total) / xp.asarray(max_ds_step, dtype=xp.float64)))
+            n_sub = max(n_sub, 1)
 
-            # NEW: horizon intersection on the segment we are about to take
-            hits_horizon = self._segment_hits_sphere(p, rd, ds, self.scene.bh.center, float(self.scene.bh.horizon))
-            fell_in = fell_in | (active & hits_horizon)
+            remaining = ds_total
 
-            # recompute active after horizon
-            active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
-            ds = ds * active.astype(xp.float64)
+            for _sub in range(n_sub):
+                active_sub = (
+                    (~hit)
+                    & (~fell_in)
+                    & (traveled < float(self.scene.bounds.far_distance))
+                    & (remaining > 0.0)
+                )
+                if not bool(xp.any(active_sub)):
+                    break
 
-            p = p + rd * ds[..., None]
-            traveled = traveled + ds
+                # Pre-substep SDFs
+                d_obj_pre = self.scene.surface.sdf(p)
 
-            rd = self.scene.bh.bend_batch(rd, p, ds)
+                dist_bh_pre = xp.linalg.norm(p - self.scene.bh.center[None, None, :], axis=-1)
+                h_sdf_pre = dist_bh_pre - float(self.scene.bh.horizon)
+
+                # Sub-step size is capped by max_ds_step, by remaining,
+                # AND adaptively by distance to the object to reduce grazing overshoot.
+                k = float(getattr(cfg, "ds_surface_factor", 0.25))  # try 0.25, then 0.1 if needed
+
+                ds_cap_surface = k * xp.maximum(
+                    d_obj_pre,
+                    xp.asarray(float(cfg.eps), dtype=xp.float64),
+                )
+
+                ds_cap = xp.minimum(
+                    xp.asarray(max_ds_step, dtype=xp.float64),
+                    ds_cap_surface,
+                )
+
+                ds = xp.minimum(remaining, ds_cap)
+                ds = ds * active_sub.astype(xp.float64)
+
+                # Advance (straight-line step in Newtonian)
+                p_new = p + rd * ds[..., None]
+
+                # Post-substep SDFs
+                d_obj_post = self.scene.surface.sdf(p_new)
+
+                dist_bh_post = xp.linalg.norm(p_new - self.scene.bh.center[None, None, :], axis=-1)
+                h_sdf_post = dist_bh_post - float(self.scene.bh.horizon)
+
+                # --------------------------------------------------------
+                # Termination logic (SDF-only)
+                # --------------------------------------------------------
+
+                # Object hit tests
+                hit_post = d_obj_post < float(cfg.eps)
+                # Optional crossing test for signed SDFs:
+                crossed_obj = (d_obj_pre > 0.0) & (d_obj_post <= 0.0)
+                hit = hit | (active_sub & (hit_post | crossed_obj))
+
+                # Horizon capture tests (sphere-horizon SDF, but still SDF-only)
+                fell_post = h_sdf_post <= 0.0
+                crossed_h = (h_sdf_pre > 0.0) & (h_sdf_post <= 0.0)
+                fell_in = fell_in | (active_sub & (fell_post | crossed_h))
+
+                # Apply the move only for rays still active after terminations
+                still = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
+                m3 = still[..., None]
+                p = xp.where(m3, p_new, p)
+
+                traveled = traveled + ds
+                remaining = remaining - ds
+
+                # Newtonian bending (direction update)
+                # Only bend for rays that are still active (avoid NaNs after capture)
+                rd = xp.where(m3, self.scene.bh.bend_batch(rd, p, ds), rd)
 
         return ImageMarchResult(hit=hit, fell_in=fell_in, traveled=traveled)
+
+
+class ImageMarcherSchwarzschild:
+    """Batch image marcher for Schwarzschild-style curved rays.
+
+    This marcher does not assume straight segments. It delegates position and direction
+    updates to a geodesic stepper stored in scene.bh.
+
+    Required scene interface:
+      - scene.surface.sdf(p) -> (H,W) float distances
+      - scene.bounds.far_distance (float)
+      - scene.bh.init_batch(ro, rd0) -> state (any, typically dict of arrays)
+      - scene.bh.advance_batch(state, ds) -> (p_new, rd_new, fell_in_now)
+
+    ds is interpreted by the stepper (it may map ds to dphi, dλ, etc).
+
+    Why max_ds_step / substepping:
+      - The original logic only checked the SDF at p (dist0) and after one big GR step (dist1).
+      - With curved rays, it's easy to "enter and exit" the object in a single step:
+          dist0 > 0, you go through the sphere, and land outside again with dist1 > 0.
+        That misses both:
+          hit_post (dist1 < eps)  and  crossed (dist0 > 0 and dist1 <= 0)
+      - Result: a few pixels incorrectly reach the background (white spot / holes).
+      - Substepping caps the per-update ds so we sample the SDF often enough to detect hits.
+    """
+
+    def __init__(self, xp: ArrayModule, config: ImageMarchConfig, scene: Any) -> None:
+        """Initialise the marcher."""
+        self.xp = xp
+        self.config = config
+        self.scene = scene
+
+    def march(self, ro: Any, rd0: Any) -> ImageMarchResult:
+        xp = self.xp
+        cfg = self.config
+
+        rd = normalize(xp, rd0.astype(xp.float64))
+
+        # Broadcast camera origin to per-pixel positions.
+        p = xp.zeros_like(rd)
+        p[..., 0] = ro[0]
+        p[..., 1] = ro[1]
+        p[..., 2] = ro[2]
+
+        traveled = xp.zeros(rd.shape[:-1], dtype=xp.float64)
+
+        hit = xp.zeros(rd.shape[:-1], dtype=bool)
+        fell_in = xp.zeros(rd.shape[:-1], dtype=bool)
+
+        state = self.scene.bh.init_batch(ro=p, rd0=rd)
+
+        # NEW: cap for a single geodesic advance.
+        # If ds_total is larger than this, we split it into multiple sub-steps.
+        # Start with something like 0.005 - 0.02 depending on quality vs speed.
+        max_ds_step = float(getattr(cfg, "max_ds_step", cfg.max_step))
+        max_ds_step = max(max_ds_step, 1e-12)
+
+        for _ in range(cfg.max_steps):
+            active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
+            if not bool(xp.any(active)):
+                break
+
+            # Distance at the *start* of this outer iteration.
+            dist0 = self.scene.surface.sdf(p)
+
+            hit_now = dist0 < float(cfg.eps)
+            hit = hit | (active & hit_now)
+
+            active = (~hit) & (~fell_in) & (traveled < float(self.scene.bounds.far_distance))
+            if not bool(xp.any(active)):
+                break
+
+            # IMPORTANT for GR: don't force a positive min_step near the surface,
+            # it causes tunneling (skipping over the hit band).
+            #
+            # This is our "desired" step for the iteration (before substepping).
+            ds_total = xp.clip(dist0, 0.0, float(cfg.max_step))
+            ds_total = ds_total * active.astype(xp.float64)
+
+            # If nothing left to do, we can stop.
+            if float(xp.max(ds_total)) <= 0.0:
+                break
+
+            # NEW: choose how many sub-steps to take for the worst-case ray in the batch.
+            # We do a batch-wide n_sub for simplicity (fast + predictable).
+            n_sub = int(xp.ceil(xp.max(ds_total) / xp.asarray(max_ds_step, dtype=xp.float64)))
+            n_sub = max(n_sub, 1)
+
+            remaining = ds_total
+
+            for _sub in range(n_sub):
+                # Only sub-step rays that are still active and still have remaining distance to advance.
+                active_sub = (
+                    (~hit)
+                    & (~fell_in)
+                    & (traveled < float(self.scene.bounds.far_distance))
+                    & (remaining > 0.0)
+                )
+                if not bool(xp.any(active_sub)):
+                    break
+
+                # Pre-substep SDF. This matters: crossing detection must be per sub-step.
+                dist_pre = self.scene.surface.sdf(p)
+
+                # Sub-step size is capped by max_ds_step and also by remaining.
+                # Sub-step size is capped by max_ds_step, by remaining,
+                # AND adaptively by distance to the object to reduce grazing overshoot.
+                #
+                # The factor k controls how conservative we are near the surface:
+                #   smaller k -> smaller steps near the object -> less overshoot (slower).
+                k = float(getattr(cfg, "ds_surface_factor", 0.25))  # try 0.25, then 0.1 if needed
+
+                ds_cap_surface = k * xp.maximum(
+                    dist_pre,
+                    xp.asarray(float(cfg.eps), dtype=xp.float64),
+                )
+
+                ds_cap = xp.minimum(
+                    xp.asarray(max_ds_step, dtype=xp.float64),
+                    ds_cap_surface,
+                )
+
+                ds = xp.minimum(remaining, ds_cap)
+                ds = ds * active_sub.astype(xp.float64)
+
+                p_new, rd_new, fell_now = self.scene.bh.advance_batch(state, ds)
+
+                m3 = active_sub[..., None]
+                p = xp.where(m3, p_new, p)
+                rd = xp.where(m3, rd_new, rd)
+
+                # Post-substep hit test to avoid tunneling.
+                dist_post = self.scene.surface.sdf(p)
+                hit_post = dist_post < float(cfg.eps)
+
+                # For signed SDFs (sphere), crossing into the object means we hit it even if we skipped eps.
+                # Doing this per sub-step prevents "enter + exit in one big step" misses.
+                crossed = (dist_pre > 0.0) & (dist_post <= 0.0)
+
+                hit = hit | (active_sub & (hit_post | crossed))
+
+                # Only mark fell_in for rays that did not just hit the object.
+                fell_in = fell_in | (active_sub & (~hit_post) & (~crossed) & fell_now)
+
+                traveled = traveled + ds
+                remaining = remaining - ds
+
+        return ImageMarchResult(hit=hit, fell_in=fell_in, traveled=traveled)
+
