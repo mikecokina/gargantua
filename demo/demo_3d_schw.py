@@ -7,10 +7,13 @@ from matplotlib.animation import FuncAnimation
 from gargantua.backend import BackendName, get_array_module, to_numpy
 from gargantua.camera.camera3d import Camera3D
 from gargantua.geometry import SphereSDF
-from gargantua.math_utils import normalize
-from gargantua.physics.newtonian import BlackHoleBender
-from gargantua.raymarch.config import RayMarchConfig
-from gargantua.raymarch.marcher import ImageMarchConfig, ImageMarcherNewtonian, RayMarcher
+from gargantua.physics.geodesics.schwarzschild_3d import (
+    SchwarzschildBlackHole3D,
+    SchwarzschildConfig3D,
+    SchwarzschildGeodesicStepper3D,
+    SchwarzschildNullGeodesicTracer3D,
+)
+from gargantua.raymarch.marcher import ImageMarchConfig, ImageMarcherSchwarzschild
 from gargantua.scene import Scene, SceneBounds
 
 try:
@@ -18,15 +21,23 @@ try:
 except ImportError:  # pragma: no cover
     tqdm = None
 
-import matplotlib
+import matplotlib as mpl
 
-matplotlib.use("TkAgg", force=True)
+mpl.use("TkAgg", force=True)
 
 import matplotlib.pyplot as plt  # noqa
 
 # ============================================================
 # TOP-LEVEL SCENE + CAMERA + RENDER SETTINGS (edit these)
 # ============================================================
+# This file is aligned to the Newtonian demo's "width + height + fov_x only" approach.
+# - You set RENDER_WIDTH and RENDER_HEIGHT directly
+# - You set FOV_HORIZONTAL_DEG (fov_x)
+# - fov_y is computed only for reference/debug (not needed by Camera3D)
+# - Variable names match Newtonian where possible
+# ============================================================
+
+# Backend / run
 BACKEND: BackendName = "auto"
 NO_GRAVITY = False
 FRAMES_N = 5
@@ -41,42 +52,43 @@ SPHERE_CENTER_NP = np.array([0.0, 0.0, 5.5], dtype=np.float64)
 SPHERE_RADIUS = 1.0
 
 BH_CENTER_NP = np.array([0.4, 0.0, 3.0], dtype=np.float64)
-BH_MASS = 0.55
-BH_HORIZON = 0.75
-BH_SOFTENING = 5e-2
+
+# Schwarzschild physics
+# NOTE: horizon radius = 2M (in these units)
+BH_MASS = 0.35  # (mass_length in your Schwarzschild units)
+BH_DPHI = 1e-3
+BH_ESCAPE_RADIUS = 80.0  # should match FAR_DISTANCE
 
 # Camera projection mode
 # "rectilinear" = pinhole (no egg distortion)
 # "equirectangular" = lat-long / panoramic (edge distortion expected)
-# CAMERA_PROJECTION = "equirectangular"  # or "rectilinear"
-CAMERA_PROJECTION = "rectilinear"
+CAMERA_PROJECTION = "equirectangular"  # or "rectilinear"
 
 # Camera start / path
-# CAMERA_RO = np.array([0.6, 0.0, -5.5], dtype=np.float64)
 CAMERA_RO = np.array([5.0, 0.0, -3.0], dtype=np.float64)
-
 SLIDE_RO_OFFSET_PER_T = np.array([-1.2, 0.0, 0.0], dtype=np.float64)  # multiplied by t
 
-# Where the camera looks (WORLD-SPACE direction vector)
+# Where the camera looks (WORLD-SPACE direction vector) - used only in SLIDE mode
 LOOK_FORWARD_NP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-# Render resolution + FOV
+# Render resolution + FOV (match Newtonian)
 RENDER_WIDTH = 320
 RENDER_HEIGHT = 240
 FOV_HORIZONTAL_DEG = 90.0
 UP_NP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
-# March configs (image marcher)
-IMAGE_MARCH_MAX_STEPS = 220
+# Image marcher (Schwarzschild)
+IMAGE_MARCH_MAX_STEPS = 1240
 IMAGE_MARCH_EPS = 1e-3
-IMAGE_MARCH_MIN_STEP = 1e-3
-IMAGE_MARCH_MAX_STEP = 0.08
+IMAGE_MARCH_MIN_STEP = 1e-4
+IMAGE_MARCH_MAX_STEP = 0.01
+MAX_DS_STEP = 0.01
 
 # ============================================================
 # TRUE 2D SLICE PLOT (single physical plane)
 # ============================================================
-DEBUG_NUM_RAYS_SLICE = 41
-DECIMATE_STRIDE = 2
+DEBUG_NUM_RAYS_SLICE = 33
+DECIMATE_STRIDE = 1
 DEBUG_ARROW_LEN = 2.5  # arrow length in slice (u,v) units
 INTERSECTION_SAMPLES = 720
 
@@ -86,9 +98,10 @@ RIGHT_PLOT_TITLE = (
     "2D slice plane through camera + BH center\n"
     "UV axes are slice-plane basis (not the camera image plane)"
 )
+
 ULIM = (-10, 10)
 VLIM = (-4, 20)
-INTERVAL_MS = 320
+INTERVAL_MS = 220
 
 # 3rd plot: world XZ overview (no rays, just objects + camera motion/basis)
 XZ_TITLE = "World XZ overview (objects + camera motion/basis)"
@@ -97,20 +110,24 @@ XZ_ZLIM = (-10, 25)
 XZ_ARROW_LEN = 1.5
 
 
+# ============================================================
+# Helpers
+# ============================================================
+
 def normalize_vector_np(v: np.ndarray) -> np.ndarray:
     """Normalize a numpy vector."""
-    v_norm = np.linalg.norm(v)
-    if v_norm < 1e-12:
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
         return v
-    return v / v_norm
+    return v / n
 
 
 def render_colors(hit: np.ndarray, fell_in: np.ndarray) -> np.ndarray:
     """Simple RGB coloring."""
     h, w = hit.shape
     img = np.ones((h, w, 3), dtype=np.float32)
-    img[fell_in] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    img[hit] = np.array([0.15, 0.35, 1.0], dtype=np.float32)
+    img[fell_in] = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # capture
+    img[hit] = np.array([0.15, 0.35, 1.0], dtype=np.float32)  # sphere hit
     return img
 
 
@@ -120,7 +137,7 @@ def camera_path_orbit_ro(
         bh_center_np: np.ndarray,
         cam_start_ro_np: np.ndarray,
 ) -> np.ndarray:
-    """Orbit BH in XZ plane, starting exactly at CAM_START_RO_NP (and keeping its Y)."""
+    """Orbit BH in XZ plane, starting exactly at CAMERA_RO (and keeping its Y)."""
     dx = float(cam_start_ro_np[0] - bh_center_np[0])
     dz = float(cam_start_ro_np[2] - bh_center_np[2])
 
@@ -128,6 +145,9 @@ def camera_path_orbit_ro(
     if r < 1e-12:
         r = 1e-12
 
+    # Parameterization:
+    # x = bh_x + r*cos(a)
+    # z = bh_z - r*sin(a)
     a0 = float(np.arctan2(-dz, dx))
 
     t = i / float(max(1, n_frames - 1))
@@ -150,6 +170,7 @@ def camera_path_slide_ro(i: int, n_frames: int) -> np.ndarray:
 
 
 def _compute_fov_vertical_deg(width: int, height: int, fov_horizontal_deg: float) -> float:
+    """Compute fov_y from fov_x and aspect, only for reference/debug."""
     aspect = float(width) / float(height)
     return float(
         np.rad2deg(
@@ -209,7 +230,12 @@ def _stabilize_slice_basis(
             v_hat = -v_hat
             u_hat = -u_hat  # flip both keeps n the same
 
-    # (Optional: you can also continuity-lock u, but v is the main culprit)
+    # Optional: continuity-lock u too (rarely needed, but kept for symmetry with Newtonian).
+    if prev_u_hat is not None:
+        if float(np.dot(u_hat, prev_u_hat)) < 0.0:
+            u_hat = -u_hat
+            v_hat = -v_hat  # keep handedness consistent
+
     return u_hat, v_hat, n_hat
 
 
@@ -229,7 +255,8 @@ def _slice_fan_dirs_xp(
     out: list[np.ndarray] = []
     for x in xs:
         d_np = v_hat_np + x * u_hat_np
-        out.append(normalize(xp, xp.asarray(d_np, dtype=xp.float64)))
+        d_np = normalize_vector_np(d_np)
+        out.append(xp.asarray(d_np, dtype=xp.float64))
     return out
 
 
@@ -250,6 +277,7 @@ def _sphere_plane_intersection_circle(
         plane_point: np.ndarray,
         plane_n_unit: np.ndarray,
 ) -> tuple[np.ndarray, float] | None:
+    """Return (circle_center_world, circle_radius) or None."""
     dist = float(np.dot(sphere_center - plane_point, plane_n_unit))
     if abs(dist) > sphere_radius:
         return None
@@ -273,56 +301,65 @@ def _circle_points_in_plane(
     )
 
 
-def build_scene(*, xp: np.ndarray, no_gravity: bool) -> tuple[Scene, np.ndarray, np.ndarray]:
+# ============================================================
+# Main
+# ============================================================
+
+def main(*, backend: BackendName = BACKEND, no_gravity: bool = NO_GRAVITY) -> None:
+    xp = get_array_module(backend)
+
+    # -------- Scene surface --------
     sphere_center = xp.asarray(SPHERE_CENTER_NP, dtype=xp.float64)
-    surface = SphereSDF(xp=xp, center=sphere_center, radius=float(SPHERE_RADIUS))
+    sphere_radius = float(SPHERE_RADIUS)
+    surface = SphereSDF(xp=xp, center=sphere_center, radius=sphere_radius)
 
+    # -------- Schwarzschild BH setup --------
     bh_center = xp.asarray(BH_CENTER_NP, dtype=xp.float64)
-    bh = BlackHoleBender(
-        xp=xp,
-        center=bh_center,
-        mass=0.0 if no_gravity else float(BH_MASS),
-        horizon=float(BH_HORIZON),
-        softening=float(BH_SOFTENING),
+    cfg = SchwarzschildConfig3D(
+        mass_length=0.0 if no_gravity else float(BH_MASS),
+        dphi=float(BH_DPHI),
+        escape_radius=float(BH_ESCAPE_RADIUS),
     )
+    bh_params = SchwarzschildBlackHole3D(xp=xp, center=bh_center, cfg=cfg)
+    bh_stepper = SchwarzschildGeodesicStepper3D(xp=xp, bh=bh_params)
 
+    # Scene: ImageMarcherSchwarzschild expects scene.bh to be the stepper
     scene = Scene(
         surface=surface,
-        bh=bh,
+        bh=bh_stepper,
         bounds=SceneBounds(far_distance=float(FAR_DISTANCE)),
         drawables=[],
     )
-    return scene, sphere_center, bh_center
 
-
-def main() -> None:
-    xp = get_array_module(BACKEND)
-
-    scene, _sphere_center, bh_center = build_scene(xp=xp, no_gravity=NO_GRAVITY)
-
-    image_marcher = ImageMarcherNewtonian(
+    # -------- Marchers --------
+    image_marcher = ImageMarcherSchwarzschild(
         xp=xp,
         config=ImageMarchConfig(
             max_steps=int(IMAGE_MARCH_MAX_STEPS),
             eps=float(IMAGE_MARCH_EPS),
             min_step=float(IMAGE_MARCH_MIN_STEP),
             max_step=float(IMAGE_MARCH_MAX_STEP),
+            max_ds_step=float(MAX_DS_STEP),
         ),
         scene=scene,
     )
 
-    ray_marcher = RayMarcher(xp=xp, config=RayMarchConfig(), scene=scene)
+    # For polyline debug, use tracer (not image marcher)
+    tracer = SchwarzschildNullGeodesicTracer3D(xp=xp, bh=bh_params, surface=surface)
 
+    # -------- Camera + render --------
     width, height = int(RENDER_WIDTH), int(RENDER_HEIGHT)
     fov_horizontal_deg = float(FOV_HORIZONTAL_DEG)
-    fov_vertical_deg = _compute_fov_vertical_deg(width, height, fov_horizontal_deg)
+    _fov_vertical_deg = _compute_fov_vertical_deg(width, height, fov_horizontal_deg)  # reference only
     up = xp.asarray(UP_NP, dtype=xp.float64)
 
     frames_n = int(FRAMES_N)
+
     bh_center_np = to_numpy(xp, bh_center)
     world_up_np_unit = normalize_vector_np(UP_NP)
     base_forward_np = normalize_vector_np(LOOK_FORWARD_NP)
 
+    # Precompute all frames (image + slice rays + slice basis + XZ debug)
     imgs: list[np.ndarray] = []
     rays_uv_frames: list[list[np.ndarray]] = []
     slice_basis_frames: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []  # (ro, u_hat, v_hat, n_hat)
@@ -334,14 +371,19 @@ def main() -> None:
     prev_u_hat: np.ndarray | None = None
     prev_v_hat: np.ndarray | None = None
 
-    frame_iter = range(frames_n)
+    it = range(frames_n)
     if USE_TQDM and tqdm is not None:
-        frame_iter = tqdm(frame_iter, total=frames_n, desc="Rendering frames")
+        it = tqdm(it, total=frames_n, desc="Rendering frames")
 
-    for i in frame_iter:
+    for i in it:
+        # ============================================================
+        # CAMERA PATH BEHAVIOR
+        # - orbit: orbit BH and always look at BH center
+        # - slide: translate and keep fixed LOOK_FORWARD_NP
+        # ============================================================
         if USE_ORBIT_PATH:
             ro_np = camera_path_orbit_ro(i, frames_n, bh_center_np, CAMERA_RO)
-            forward_np = normalize_vector_np(bh_center_np - ro_np)
+            forward_np = normalize_vector_np(bh_center_np - ro_np)  # always look at BH
         else:
             ro_np = camera_path_slide_ro(i, frames_n)
             forward_np = base_forward_np
@@ -357,7 +399,7 @@ def main() -> None:
             xp=xp,
         )
 
-        # 1) Render image
+        # ===== 1) Image =====
         rd0 = cam.ray_grid(
             xp,
             width=width,
@@ -370,10 +412,10 @@ def main() -> None:
             render_colors(
                 hit=to_numpy(xp, res_img.hit),
                 fell_in=to_numpy(xp, res_img.fell_in),
-            ),
+            )
         )
 
-        # 2) TRUE 2D SLICE rays
+        # ===== 2) TRUE 2D SLICE rays =====
         fwd, right, _up_ortho = cam.basis(xp)
 
         # --- 3rd panel (world XZ) storage: camera pos + basis projected to XZ ---
@@ -397,7 +439,7 @@ def main() -> None:
             world_up_np_unit=world_up_np_unit,
         )
 
-        # ---- NEW: stabilize basis to prevent UV mirroring jumps ----
+        # Stabilize basis to prevent UV mirroring jumps
         u_hat, v_hat, n_hat = _stabilize_slice_basis(
             u_hat=u_hat,
             v_hat=v_hat,
@@ -407,7 +449,7 @@ def main() -> None:
             prev_v_hat=prev_v_hat,
         )
 
-        # ---- NEW: enforce a sign convention: +v points toward BH ----
+        # Enforce sign convention: +v points toward BH
         a_hat = normalize_vector_np(bh_center_np - ro_np)  # cam -> BH direction
         if float(np.dot(v_hat, a_hat)) < 0.0:
             v_hat = -v_hat
@@ -415,8 +457,6 @@ def main() -> None:
 
         prev_u_hat = u_hat.copy()
         prev_v_hat = v_hat.copy()
-        # -----------------------------------------------------------
-        # -----------------------------------------------------------
 
         dirs = _slice_fan_dirs_xp(
             xp=xp,
@@ -428,8 +468,9 @@ def main() -> None:
 
         rays_uv: list[np.ndarray] = []
         for d in dirs:
-            res = ray_marcher.trace(ro, d)
-            pts = to_numpy(xp, res.points)
+            rr = tracer.trace(ro, d)
+            pts = to_numpy(xp, rr.points)  # (N,3)
+
             if pts.shape[0] > 2 and int(DECIMATE_STRIDE) > 1:
                 pts = pts[:: int(DECIMATE_STRIDE)]
 
@@ -441,17 +482,17 @@ def main() -> None:
         rays_uv_frames.append(rays_uv)
         slice_basis_frames.append((ro_np, u_hat, v_hat, n_hat))
 
+    # -------- Plot (three panels) --------
     if not TWO_D_SPLIT:
-        raise RuntimeError("This demo variant expects TWO_D_SPLIT=True.")
+        raise RuntimeError("This demo variant expects TWO_D_SPLIT=True (image + 2D slice plot + XZ overview).")
 
     fig, (ax_img, ax_uv, ax_xz) = plt.subplots(1, 3, figsize=(16, 5.5))
-    fig.suptitle("Newtonian demo: image + TRUE 2D slice debug + world XZ overview")
+    fig.suptitle("Schwarzschild demo: image + TRUE 2D slice debug + world XZ overview")
 
     # Left: image
     im_artist = ax_img.imshow(imgs[0], origin="upper", aspect="equal")
     ax_img.set_title("Rendered image")
     ax_img.set_aspect("equal", adjustable="box")
-    # Keep axes artist enabled so spines can draw, but hide ticks/labels.
     ax_img.set_xticks([])
     ax_img.set_yticks([])
     ax_img.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
@@ -470,10 +511,11 @@ def main() -> None:
 
     ax_uv.scatter([0.0], [0.0], s=80, marker="x", linewidths=2, zorder=6)
 
-    # Debug: actual object centers projected into UV slice coordinates
+    # Debug: projected centers in UV
     bh_uv_pt = ax_uv.scatter([], [], s=40, marker="o", zorder=9)
     sphere_uv_pt = ax_uv.scatter([], [], s=40, marker="o", zorder=9)
 
+    # IMPORTANT: these arrows are slice axes, not camera axes
     uv_v_ann = ax_uv.annotate(
         "",
         xy=(0.0, float(DEBUG_ARROW_LEN)),
@@ -494,10 +536,7 @@ def main() -> None:
     sphere_line, = ax_uv.plot([], [], linewidth=2, label="Sphere ∩ slice plane")
     horizon_line, = ax_uv.plot([], [], linewidth=2, label="Horizon ∩ slice plane")
 
-    ray_lines = [
-        ax_uv.plot([], [], linewidth=1.5, alpha=0.9)[0]
-        for _ in range(int(DEBUG_NUM_RAYS_SLICE))
-    ]
+    ray_lines = [ax_uv.plot([], [], linewidth=1.5, alpha=0.9)[0] for _ in range(int(DEBUG_NUM_RAYS_SLICE))]
 
     info = ax_uv.text(
         0.02,
@@ -534,9 +573,12 @@ def main() -> None:
     sz = SPHERE_CENTER_NP[2] + float(SPHERE_RADIUS) * np.sin(th)
     ax_xz.plot(sx, sz, linewidth=2, label="Sphere (XZ)")
 
-    hx = BH_CENTER_NP[0] + float(BH_HORIZON) * np.cos(th)
-    hz = BH_CENTER_NP[2] + float(BH_HORIZON) * np.sin(th)
-    ax_xz.plot(hx, hz, linewidth=2, label="Horizon (XZ)")
+    # Schwarzschild horizon radius = 2M (in these units)
+    horizon_r = float(2.0 * (0.0 if NO_GRAVITY else float(BH_MASS)))
+    if horizon_r > 0.0:
+        hx = BH_CENTER_NP[0] + horizon_r * np.cos(th)
+        hz = BH_CENTER_NP[2] + horizon_r * np.sin(th)
+        ax_xz.plot(hx, hz, linewidth=2, label="Horizon (XZ)")
 
     cam_trail_line, = ax_xz.plot([], [], linewidth=1.5, alpha=0.8, label="camera trail")
     cam_point = ax_xz.scatter([], [], s=60, marker="x", linewidths=2, zorder=5, label="camera")
@@ -584,7 +626,6 @@ def main() -> None:
                 uv[k, 0], uv[k, 1] = _project_uv(pts[k], ro_np_, u_hat_, v_hat_)
             sphere_line.set_data(uv[:, 0], uv[:, 1])
 
-        horizon_r = float(scene.bh.horizon)
         if horizon_r <= 0.0:
             horizon_line.set_data([], [])
             return
@@ -653,7 +694,7 @@ def main() -> None:
             f"u_hat={u_hat_}\n"
             f"v_hat={v_hat_}\n"
             f"n_hat={n_hat_}\n"
-            "plane: through cam pos and BH center\n"
+            "plane: through cam_pos and BH_center\n"
             "u=dot(p-cam_pos, u_hat)\n"
             "v=dot(p-cam_pos, v_hat)",
         )
@@ -686,4 +727,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(no_gravity=NO_GRAVITY, backend=BACKEND)
