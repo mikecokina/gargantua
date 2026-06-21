@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -138,33 +139,27 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
         Returns:
             (u_next, v_next)
         """
-        m = self.bh.cfg.mass_length
+        # Closures f_u / f_v are inlined to avoid Python function-call overhead
+        # in the tight integration loop (called up to cfg.max_steps times per ray).
+        m3 = 3.0 * self.bh.cfg.mass_length
 
-        # noinspection PyUnusedLocal
-        def f_u(u0: float, v0: float) -> float:  # noqa: ARG001
-            return v0
-
-        # noinspection PyUnusedLocal
-        def f_v(u0: float, v0: float) -> float:  # noqa: ARG001
-            return -u0 + 3.0 * m * u0 * u0
-
-        k1_u = f_u(u, v)
-        k1_v = f_v(u, v)
+        k1_u = v
+        k1_v = -u + m3 * u * u
 
         u2 = u + 0.5 * h * k1_u
         v2 = v + 0.5 * h * k1_v
-        k2_u = f_u(u2, v2)
-        k2_v = f_v(u2, v2)
+        k2_u = v2
+        k2_v = -u2 + m3 * u2 * u2
 
         u3 = u + 0.5 * h * k2_u
         v3 = v + 0.5 * h * k2_v
-        k3_u = f_u(u3, v3)
-        k3_v = f_v(u3, v3)
+        k3_u = v3
+        k3_v = -u3 + m3 * u3 * u3
 
         u4 = u + h * k3_u
         v4 = v + h * k3_v
-        k4_u = f_u(u4, v4)
-        k4_v = f_v(u4, v4)
+        k4_u = v4
+        k4_v = -u4 + m3 * u4 * u4
 
         u_next = u + (h / 6.0) * (k1_u + 2.0 * k2_u + 2.0 * k3_u + k4_u)
         v_next = v + (h / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
@@ -307,6 +302,10 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
         horizon = self.bh.horizon_radius
         pts: list[Any] = [origin.copy()]
 
+        # Cache the BH center array once — creating xp.asarray inside the loop
+        # allocates a new array on every iteration (up to cfg.max_steps times).
+        bh_center = xp.asarray(self.bh.center, dtype=xp.float64)
+
         for _ in range(cfg.max_steps):
             u, v = self._rk4_step(u, v, h)
             phi += h
@@ -316,9 +315,11 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
 
             r = 1.0 / u
 
-            cc = float(xp.cos(phi))
-            ss = float(xp.sin(phi))
-            p_world = xp.asarray(self.bh.center, dtype=xp.float64) + r * (cc * e1 + ss * e2)
+            # phi is a plain Python float here; math.cos/sin avoids the overhead of
+            # routing through xp (which would allocate temporary scalar arrays).
+            cc = math.cos(phi)
+            ss = math.sin(phi)
+            p_world = bh_center + r * (cc * e1 + ss * e2)
             pts.append(p_world)
 
             if self._check_surface_hit(p_world):
@@ -326,7 +327,7 @@ class SchwarzschildNullGeodesicTracer3D(RayTracer2D):
 
             if r <= horizon:
                 r_plot = horizon + cfg.horizon_plot_eps
-                p_world_h = xp.asarray(self.bh.center, dtype=xp.float64) + r_plot * (cc * e1 + ss * e2)
+                p_world_h = bh_center + r_plot * (cc * e1 + ss * e2)
                 pts[-1] = p_world_h
                 return RayMarchResult(False, True, False, "horizon", xp.stack(pts))
 
@@ -460,35 +461,27 @@ class SchwarzschildGeodesicStepper3D:
         Returns:
             (u_next, v_next) with the same shape as inputs.
         """
-        xp = self.xp
-        # noinspection PyUnusedLocal
-        m = xp.asarray(self.bh.cfg.mass_length, dtype=xp.float64)  # it is actually used in `f_v` method bellow
+        # f_u / f_v closures are inlined to avoid Python function-call overhead.
+        # m3 is kept as a plain Python float to avoid repeated xp.asarray allocation.
+        m3 = 3.0 * self.bh.cfg.mass_length
 
-        # u0 is on 1st position but not used
-        def f_u(_: Any, v0: Any) -> Any:
-            return v0
-
-        # v0 is on 2nd position but not used
-        def f_v(u0: Any, _: Any) -> Any:
-            return -u0 + 3.0 * m * u0 * u0
-
-        k1_u = f_u(u, v)
-        k1_v = f_v(u, v)
+        k1_u = v
+        k1_v = -u + m3 * u * u
 
         u2 = u + 0.5 * h * k1_u
         v2 = v + 0.5 * h * k1_v
-        k2_u = f_u(u2, v2)
-        k2_v = f_v(u2, v2)
+        k2_u = v2
+        k2_v = -u2 + m3 * u2 * u2
 
         u3 = u + 0.5 * h * k2_u
         v3 = v + 0.5 * h * k2_v
-        k3_u = f_u(u3, v3)
-        k3_v = f_v(u3, v3)
+        k3_u = v3
+        k3_v = -u3 + m3 * u3 * u3
 
         u4 = u + h * k3_u
         v4 = v + h * k3_v
-        k4_u = f_u(u4, v4)
-        k4_v = f_v(u4, v4)
+        k4_u = v4
+        k4_v = -u4 + m3 * u4 * u4
 
         u_next = u + (h / 6.0) * (k1_u + 2.0 * k2_u + 2.0 * k3_u + k4_u)
         v_next = v + (h / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
@@ -542,13 +535,16 @@ class SchwarzschildGeodesicStepper3D:
 
         ds = xp.asarray(ds, dtype=xp.float64)
 
+        # Precompute constant scalars once (avoids repeated xp.asarray allocation per call).
+        _tiny = xp.asarray(1e-12, dtype=xp.float64)
+        _h_cap_val = float(cfg.dphi) * float(cfg.phi_scale_max)
+        h_cap = xp.asarray(_h_cap_val, dtype=xp.float64)
+
         # Map ds to dphi conservatively (radius-aware so world displacement ~= ds)
-        u_safe = xp.maximum(u, xp.asarray(1e-12, dtype=xp.float64))
+        u_safe = xp.maximum(u, _tiny)
         r_est = 1.0 / u_safe
 
-        h_target = ds / xp.maximum(r_est, xp.asarray(1e-12, dtype=xp.float64))
-
-        h_cap = xp.asarray(float(cfg.dphi) * float(cfg.phi_scale_max), dtype=xp.float64)
+        h_target = ds / xp.maximum(r_est, _tiny)
         h_mag = xp.minimum(h_target, h_cap)
 
         h = h_mag * sign
@@ -557,7 +553,7 @@ class SchwarzschildGeodesicStepper3D:
         u_new, v_new = self._rk4_step_batch(u, v, h)
         phi_new = phi + h
 
-        u_new = xp.maximum(u_new, xp.asarray(1e-12, dtype=xp.float64))
+        u_new = xp.maximum(u_new, _tiny)
         r = 1.0 / u_new
 
         cc = xp.cos(phi_new)
@@ -587,7 +583,11 @@ class SchwarzschildGeodesicStepper3D:
         state["v"] = xp.where(radial, v, v_new)
 
         # Fell into horizon?
-        r_now = xp.linalg.norm(p_new - center, axis=-1)
+        # For non-radial rays r is already known (1/u_new); for the rare radial rays
+        # compute the norm of the linear-fallback position.  This avoids a full-array
+        # xp.linalg.norm over all pixels for the common case.
+        r_lin = xp.linalg.norm(p_lin - center, axis=-1)
+        r_now = xp.where(radial, r_lin, r)
         fell_in = r_now <= xp.asarray(self.bh.horizon_radius, dtype=xp.float64)
 
         return p_new, d_new, fell_in

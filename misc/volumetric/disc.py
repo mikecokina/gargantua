@@ -47,7 +47,7 @@ def host_scalar(x):
 # ============================================================
 
 # ---- Image / Resolution ----
-IMAGE_WIDTH = 720
+IMAGE_WIDTH = 420
 IMAGE_ASPECT = 16 / 9
 IMAGE_HEIGHT = int(round(IMAGE_WIDTH / IMAGE_ASPECT))
 IMAGE_ASPECT = IMAGE_WIDTH / IMAGE_HEIGHT

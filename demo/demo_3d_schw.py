@@ -252,12 +252,13 @@ def _slice_fan_dirs_xp(
     tx = float(np.tan(half))
     xs = np.linspace(-tx, tx, int(num_rays), dtype=np.float64)
 
-    out: list[np.ndarray] = []
-    for x in xs:
-        d_np = v_hat_np + x * u_hat_np
-        d_np = normalize_vector_np(d_np)
-        out.append(xp.asarray(d_np, dtype=xp.float64))
-    return out
+    # Vectorized: compute all directions at once, then normalize in batch.
+    dirs_np = v_hat_np[None, :] + xs[:, None] * u_hat_np[None, :]  # (N, 3)
+    norms = np.linalg.norm(dirs_np, axis=-1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    dirs_np /= norms  # in-place normalisation
+
+    return [xp.asarray(d, dtype=xp.float64) for d in dirs_np]
 
 
 def _project_uv(
@@ -268,6 +269,23 @@ def _project_uv(
 ) -> tuple[float, float]:
     d = p_world - ro_np
     return float(np.dot(d, u_hat)), float(np.dot(d, v_hat))
+
+
+def _project_uv_batch(
+        pts: np.ndarray,
+        ro_np: np.ndarray,
+        u_hat: np.ndarray,
+        v_hat: np.ndarray,
+) -> np.ndarray:
+    """Vectorized UV projection for an (N, 3) array of world-space points.
+
+    Returns an (N, 2) array [u, v] without a Python loop over points.
+    """
+    d = pts - ro_np          # (N, 3)
+    uv = np.empty((d.shape[0], 2), dtype=np.float64)
+    uv[:, 0] = d @ u_hat     # dot product broadcast over rows
+    uv[:, 1] = d @ v_hat
+    return uv
 
 
 def _sphere_plane_intersection_circle(
@@ -474,10 +492,8 @@ def main(*, backend: BackendName = BACKEND, no_gravity: bool = NO_GRAVITY) -> No
             if pts.shape[0] > 2 and int(DECIMATE_STRIDE) > 1:
                 pts = pts[:: int(DECIMATE_STRIDE)]
 
-            uv = np.zeros((pts.shape[0], 2), dtype=np.float64)
-            for k in range(pts.shape[0]):
-                uv[k, 0], uv[k, 1] = _project_uv(pts[k], ro_np, u_hat, v_hat)
-            rays_uv.append(uv)
+            # Vectorized UV projection — avoids a Python loop over every point.
+            rays_uv.append(_project_uv_batch(pts, ro_np, u_hat, v_hat))
 
         rays_uv_frames.append(rays_uv)
         slice_basis_frames.append((ro_np, u_hat, v_hat, n_hat))
@@ -621,9 +637,7 @@ def main(*, backend: BackendName = BACKEND, no_gravity: bool = NO_GRAVITY) -> No
                 plane_v_unit=v_hat_,
                 n_samples=int(INTERSECTION_SAMPLES),
             )
-            uv = np.zeros((pts.shape[0], 2), dtype=np.float64)
-            for k in range(pts.shape[0]):
-                uv[k, 0], uv[k, 1] = _project_uv(pts[k], ro_np_, u_hat_, v_hat_)
+            uv = _project_uv_batch(pts, ro_np_, u_hat_, v_hat_)
             sphere_line.set_data(uv[:, 0], uv[:, 1])
 
         if horizon_r <= 0.0:
@@ -647,9 +661,7 @@ def main(*, backend: BackendName = BACKEND, no_gravity: bool = NO_GRAVITY) -> No
                 plane_v_unit=v_hat_,
                 n_samples=int(INTERSECTION_SAMPLES),
             )
-            uv = np.zeros((pts.shape[0], 2), dtype=np.float64)
-            for k in range(pts.shape[0]):
-                uv[k, 0], uv[k, 1] = _project_uv(pts[k], ro_np_, u_hat_, v_hat_)
+            uv = _project_uv_batch(pts, ro_np_, u_hat_, v_hat_)
             horizon_line.set_data(uv[:, 0], uv[:, 1])
 
     def update(frame_i: int):
